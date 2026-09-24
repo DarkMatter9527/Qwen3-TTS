@@ -15,7 +15,23 @@
 # limitations under the License.
 
 """
-qwen_tts: Qwen-TTS package.
+qwen_tts: Qwen-TTS 包入口文件。
+
+本文件是 qwen_tts 包的对外接口，只负责"重新导出"内部模块里的关键类，
+让用户可以直接 `from qwen_tts import Qwen3TTSModel` 这种简短写法使用。
+
+包结构概览：
+  - inference/qwen3_tts_model.py：Qwen3TTSModel 主类（端到端 TTS 推理入口），
+    提供 generate_custom_voice / generate_voice_design / generate_voice_clone
+    以及 create_voice_clone_prompt 等方法。VoiceClonePromptItem 是声音克隆
+    时复用的 prompt 数据结构。
+  - inference/qwen3_tts_tokenizer.py：Qwen3TTSTokenizer（音频编解码器），
+    只负责把音频编/解码为离散 token，不处理文本。
+
+典型用法（详见各 examples 脚本）：
+  tts = Qwen3TTSModel.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+          device_map="cuda:0", dtype=torch.bfloat16,
+          attn_implementation="flash_attention_2")
 """
 
 from .inference.qwen3_tts_model import Qwen3TTSModel, VoiceClonePromptItem

@@ -13,6 +13,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+本文件职责（在整体架构中的位置）
+--------------------------------
+25Hz 版（V1）语音 tokenizer 的"语音专用 VQ 模块"层：在 `core_vq.py` 的通用 VQ 之上，
+针对语音场景做工程封装：
+- `MelSpectrogramFeatures`：BigVGAN 风格 mel 频谱图提取（音频波形 → mel）
+- `XVectorExtractor`：基于 ONNX 的说话人 x-vector 提取器（用于条件控制音色）
+- `WhisperEncoderVQ`：继承 `WhisperEncoder`，在 Transformer 某层后插入 GRVQ 量化，
+  把连续特征离散成 audio token（每秒 25 步，每步 1 个编号，码本 32768 项）
+
+术语速查
+--------
+- mel 频谱图：声音时间×频率的二维表示，由 STFT + mel 滤波器组得到
+- x-vector：经典说话人嵌入（DNN 提取），用于条件生成
+- GRVQ 分组残差 VQ：见 core_vq.py 注释
+- Whisper encoder：OpenAI Whisper 模型的编码器部分
+- 因果卷积 / 下采样 / 上采样：用 Conv1d/ConvTranspose1d 控制时间分辨率
+"""
 import sox
 import copy
 import torch
@@ -33,25 +51,35 @@ from .whisper_encoder import WhisperEncoder, Conv1d, ConvTranspose1d
 
 
 def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
+    # 动态范围压缩：log(clamp(x))，把线性功率谱压到对数尺度，更接近人耳感知
     return torch.log(torch.clamp(x, min=clip_val) * C)
 
 def spectral_normalize_torch(magnitudes):
+    # 谱归一化：对幅度谱做动态范围压缩（取对数）
     output = dynamic_range_compression_torch(magnitudes)
     return output
 
 class MelSpectrogramFeatures(nn.Module):
     """
     Calculate the BigVGAN style mel spectrogram of an input signal.
+    BigVGAN 风格的 mel 频谱图提取器。
+
+    通俗解释
+    --------
+    把音频波形 (1, T) 通过"短时傅里叶变换 (STFT) → mel 滤波器组 → 取对数"
+    转成 mel 频谱图 (n_mel_channels, n_frames)，作为后续 encoder 的输入特征。
+    BigVGAN 风格的参数（hop/win/n_fft 等）需与训练时保持一致。
+
     Args:
-        filter_length (int): The number of samples in the filter window, used for the Fourier Transform. Default is 1024.
-        hop_length (int): The number of samples between successive frames (stride of the STFT). Default is 160.
-        win_length (int): The length of the window function applied to each frame, usually less than or equal to the filter length. Default is 640.
-        n_mel_channels (int): The number of Mel-frequency channels to output from the Mel-scale spectrogram. Default is 80.
-        mel_fmin (int): The minimum frequency (in Hz) of the Mel-scale spectrogram. Default is 0.
-        mel_fmax (int): The maximum frequency (in Hz) of the Mel-scale spectrogram. Default is 8000.
-        sampling_rate (int): The sampling rate of the audio data (in Hz). Default is 16000.
-        sampling_rate_org (int, optional): The original sampling rate of the audio data before any resampling (in Hz), if applicable. Default is None.
-        padding (str): The padding mode for the input signal. 'center' pads the signal symmetrically around its center. Default is 'center'.
+        filter_length (int): STFT 的窗长（FFT 点数），默认 1024
+        hop_length (int): 相邻帧之间的步长（采样点数），决定时间分辨率，默认 160
+        win_length (int): 实际窗函数长度，默认 640
+        n_mel_channels (int): mel 通道数（频率分辨率），默认 80
+        mel_fmin (int): mel 频率下限，默认 0
+        mel_fmax (int): mel 频率上限，默认 8000
+        sampling_rate (int): 输入音频采样率，默认 16000
+        sampling_rate_org (int, optional): 原始采样率（用于重采样时记录），默认 None
+        padding (str): 填充模式，'center' 居中对称填，默认 'center'
  
     Returns:
         torch.Tensor: Mel spectrogram.
@@ -80,36 +108,46 @@ class MelSpectrogramFeatures(nn.Module):
         self.mel_fmin = mel_fmin
         self.mel_fmax = mel_fmax
         self.sampling_rate = sampling_rate
+        # 原始采样率未指定时与 sampling_rate 一致
         self.sampling_rate_org = sampling_rate_org if sampling_rate_org is not None else sampling_rate
+        # mel 滤波器矩阵和 hann 窗按设备缓存（避免重复创建）
         self.mel_basis = {}
         self.hann_window = {}
 
     def forward(self, audio: torch.Tensor, **kwargs) -> torch.Tensor:
+        # 不计算梯度（mel 提取是确定的可逆预处理）
         with torch.no_grad():
             feats = self.extract(audio, **kwargs) 
         return feats
     
     def extract(self, audio, **kwargs):
+        # 把音频波形提取为 mel 频谱图（频率维 × 时间维）
 
+        # 输入可能是 (B,1,T) 或 (B,T) 等，统一压到 (B,T)
         if len(audio.shape) == 3:
             audio = audio.squeeze(1) if audio.shape[1] == 1 else audio.squeeze(2)
         assert len(audio.shape) == 2
 
         y = audio
+        # 懒加载：第一次按采样率和设备缓存 mel_basis 和 hann_window
         if len(list(self.mel_basis.keys())) == 0:
             mel = librosa_mel_fn(sr=self.sampling_rate, n_fft=self.filter_length, n_mels=self.n_mel_channels, fmin=self.mel_fmin, fmax=self.mel_fmax)
             self.mel_basis[str(self.mel_fmax)+'_'+str(y.device)] = torch.from_numpy(mel).float().to(y.device)
             self.hann_window[str(y.device)] = torch.hann_window(self.win_length).to(y.device)
 
+        # 'center' 填充：左右对称反射补零，保证 STFT 帧对齐
         y = torch.nn.functional.pad(y.unsqueeze(1), (int((self.filter_length-self.hop_length)/2), int((self.filter_length-self.hop_length)/2)), mode='reflect')
         y = y.squeeze(1)
 
+        # STFT → 复数谱 → 取幅度
         spec = torch.stft(y, self.filter_length, hop_length=self.hop_length, win_length=self.win_length, window=self.hann_window[str(y.device)],
                           center=False, pad_mode='reflect', normalized=False, onesided=True, return_complex=True)
         spec = torch.view_as_real(spec)
         spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
 
+        # mel 滤波器组：把线性频率维压到 mel 频率维
         spec = torch.matmul(self.mel_basis[str(self.mel_fmax)+'_'+str(y.device)], spec)
+        # 谱归一化（取对数，压缩动态范围）
         spec = spectral_normalize_torch(spec)
     
         return spec

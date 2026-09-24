@@ -13,6 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# 本脚本演示 Qwen3-TTS "VoiceDesign" 模型（自然语言描述生成音色）的用法。
+# 模型：Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign。
+# 与 CustomVoice 不同：这里没有预置音色名，而是用一段自然语言 instruct
+# 描述想要的音色特征（音色、音调、情绪、年龄感等），模型据此合成。
+#
+# 核心 API：tts.generate_voice_design(text, language, instruct)
+#
+# 运行：python examples/test_model_12hz_voice_design.py
+# 输出：当前目录生成 qwen3_tts_test_voice_design_single.wav 与 batch_*.wav。
 import time
 import torch
 import soundfile as sf
@@ -24,6 +34,7 @@ def main():
     device = "cuda:0"
     MODEL_PATH = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/"
 
+    # 模型加载（同 custom_voice 示例）：bfloat16 + FlashAttention-2。
     tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
         device_map=device,
@@ -31,7 +42,8 @@ def main():
         attn_implementation="flash_attention_2",
     )
 
-    # -------- Single --------
+    # -------- 单条合成：用 instruct 描述音色 --------
+    # 例：要求生成"撒娇稚嫩的萝莉女声，音调偏高且起伏明显"。
     torch.cuda.synchronize()
     t0 = time.time()
 
@@ -47,7 +59,8 @@ def main():
 
     sf.write("qwen3_tts_test_voice_design_single.wav", wavs[0], sr)
 
-    # -------- Batch --------
+    # -------- 批量合成：中英文 + 不同音色描述 --------
+    # 文本/语种/instruct 都是 list 按位置对应。
     texts = [
         "哥哥，你回来啦，人家等了你好久好久了，要抱抱！",
         "It's in the top drawer... wait, it's empty? No way, that's impossible! I'm sure I put it there!"

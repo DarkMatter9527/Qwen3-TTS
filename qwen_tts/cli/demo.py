@@ -13,6 +13,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# 本文件是 Qwen3-TTS 的 Gradio Web UI demo 入口（CLI 命令 `qwen-tts-demo`）。
+# Gradio 是一个用几行 Python 起网页 UI 的库，本文件用它把三种 Qwen3-TTS 模型
+# （CustomVoice / VoiceDesign / Base）的推理能力封装成可视化界面：
+#   - CustomVoice 模型：选择内置音色 + 文本 + 可选 instruct 情感描述 -> 合成音频；
+#   - VoiceDesign 模型：文本 + 自然语言音色描述 -> 合成音频；
+#   - Base 模型：上传参考音频 + 参考文本 -> 声音克隆；或保存/加载可复用的克隆音色文件。
+#
+# 程序流程：main() 解析命令行参数 -> 加载模型 -> build_demo() 构建 Gradio Blocks UI
+#          -> demo.queue().launch() 起服务。
+# 用户在浏览器里点击 Generate 按钮触发对应 run_* 回调，回调内部调用 Qwen3TTSModel 的
+# generate_custom_voice / generate_voice_design / generate_voice_clone 方法。
+#
+# 在整体架构中的位置：qwen_tts.cli.demo 是面向用户的"试用"入口，
+# 与 examples/ 下的脚本相比，它把命令行示例升级成可视化交互界面，方便非开发者使用。
 """
 A gradio demo for Qwen3 TTS models.
 """
@@ -31,12 +46,16 @@ from .. import Qwen3TTSModel, VoiceClonePromptItem
 
 
 def _title_case_display(s: str) -> str:
+    """把 'vivian_zh' 这样的内部名转成 'Vivian Zh' 用于下拉框显示。
+    仅影响展示，不影响传给模型的实际值。"""
     s = (s or "").strip()
     s = s.replace("_", " ")
     return " ".join([w[:1].upper() + w[1:] if w else "" for w in s.split()])
 
 
 def _build_choices_and_map(items: Optional[List[str]]) -> Tuple[List[str], Dict[str, str]]:
+    """根据内部名列表构造 (展示名列表, 展示名->内部名 映射)。
+    Gradio 下拉框只显示展示名，回调里再用映射换回内部名传给模型。"""
     if not items:
         return [], {}
     display = [_title_case_display(x) for x in items]
@@ -45,6 +64,7 @@ def _build_choices_and_map(items: Optional[List[str]]) -> Tuple[List[str], Dict[
 
 
 def _dtype_from_str(s: str) -> torch.dtype:
+    """把命令行字符串（'bfloat16' / 'fp16' / 'fp32' 等）转成 torch.dtype。"""
     s = (s or "").strip().lower()
     if s in ("bf16", "bfloat16"):
         return torch.bfloat16
@@ -56,10 +76,19 @@ def _dtype_from_str(s: str) -> torch.dtype:
 
 
 def _maybe(v):
+    """工具函数：v 为 None 时返回 gr.update()（保持组件原状），否则返回 v。"""
     return v if v is not None else gr.update()
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """构造命令行参数解析器。分四组：
+      1) checkpoint 位置参数 / -c：模型仓库 id 或本地路径；
+      2) 模型加载参数：--device / --dtype / --flash-attn（影响 from_pretrained）；
+      3) Gradio 服务参数：--ip / --port / --share / --concurrency；
+      4) HTTPS 参数：--ssl-certfile / --ssl-keyfile / --ssl-verify；
+      5) 可选采样参数：--max-new-tokens / --temperature / --top-k / --top-p /
+         --repetition-penalty / --subtalker-*（透传给 generate_*）。
+    """
     parser = argparse.ArgumentParser(
         prog="qwen-tts-demo",
         description=(
@@ -74,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
         add_help=True,
     )
 
-    # Positional checkpoint (also supports -c/--checkpoint)
+    # 模型路径：位置参数（必填其一），也支持 -c/--checkpoint 别名。
     parser.add_argument(
         "checkpoint_pos",
         nargs="?",
@@ -88,7 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Model checkpoint path or HuggingFace repo id (optional if positional is provided).",
     )
 
-    # Model loading / from_pretrained args
+    # 模型加载参数（透传给 Qwen3TTSModel.from_pretrained）。
     parser.add_argument(
         "--device",
         default="cuda:0",
@@ -108,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable FlashAttention-2 (default: enabled).",
     )
 
-    # Gradio server args
+    # Gradio 服务绑定参数。
     parser.add_argument(
         "--ip",
         default="0.0.0.0",
@@ -134,7 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Gradio queue concurrency (default: 16).",
     )
 
-    # HTTPS args
+    # HTTPS 相关参数（可选），用于以 HTTPS 方式暴露 demo。
     parser.add_argument(
         "--ssl-certfile",
         default=None,
@@ -153,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Whether to verify SSL certificate (default: enabled).",
     )
 
-    # Optional generation args
+    # 可选生成参数：未传（None）时不会传给 generate_*，使用模型内部默认值。
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Max new tokens for generation (optional).")
     parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature (optional).")
     parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling (optional).")
@@ -169,6 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_checkpoint(args: argparse.Namespace) -> str:
+    """合并位置参数与 -c/--checkpoint，返回最终模型路径；都没给就退出。"""
     ckpt = args.checkpoint or args.checkpoint_pos
     if not ckpt:
         raise SystemExit(0)  # main() prints help
@@ -176,6 +206,8 @@ def _resolve_checkpoint(args: argparse.Namespace) -> str:
 
 
 def _collect_gen_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    """把命令行里非空的采样参数收集到一个 dict，会作为 **kwargs 透传给 generate_*。
+    这样未指定的参数就不传，由模型用内部默认值。"""
     mapping = {
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature,
@@ -190,6 +222,9 @@ def _collect_gen_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def _normalize_audio(wav, eps=1e-12, clip=True):
+    """把任意 dtype/范围的音频波形统一成 [-1, 1] 的 float32 单声道。
+    支持整数 PCM（按位深归一化）、浮点（按峰值归一化）、多声道（取均值）。
+    Gradio 上传的音频格式可能千差万别，需要这一步规范化后才能喂给模型。"""
     x = np.asarray(wav)
 
     if np.issubdtype(x.dtype, np.integer):
@@ -222,6 +257,9 @@ def _normalize_audio(wav, eps=1e-12, clip=True):
 
 
 def _audio_to_tuple(audio: Any) -> Optional[Tuple[np.ndarray, int]]:
+    """把 Gradio gr.Audio 组件的多种返回形式统一成 (wav, sr) 元组。
+    Gradio 在不同版本/不同 type= 配置下可能返回 (sr, wav) 元组或 dict；
+    这里都规范化并经过 _normalize_audio 处理。返回 None 表示没有有效音频。"""
     if audio is None:
         return None
 
@@ -239,11 +277,14 @@ def _audio_to_tuple(audio: Any) -> Optional[Tuple[np.ndarray, int]]:
 
 
 def _wav_to_gradio_audio(wav: np.ndarray, sr: int) -> Tuple[int, np.ndarray]:
+    """模型产出的 (wav, sr) 反向包装成 Gradio gr.Audio 期望的 (sr, wav) 顺序。"""
     wav = np.asarray(wav, dtype=np.float32)
     return sr, wav
 
 
 def _detect_model_kind(ckpt: str, tts: Qwen3TTSModel) -> str:
+    """从加载后的模型配置里读 tts_model_type，决定 demo 显示哪种 UI。
+    取值应为 'custom_voice' / 'voice_design' / 'base' 之一。"""
     mt = getattr(tts.model, "tts_model_type", None)
     if mt in ("custom_voice", "voice_design", "base"):
         return mt
@@ -252,8 +293,13 @@ def _detect_model_kind(ckpt: str, tts: Qwen3TTSModel) -> str:
 
 
 def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]) -> gr.Blocks:
+    """根据模型类型构建对应的 Gradio Blocks 界面。
+    - 先查出该模型支持的语种/说话人列表，转成下拉框展示名；
+    - 根据 model_kind 走三个分支之一构造 UI；
+    - 末尾加免责声明。返回的 gr.Blocks 对象由 main() 调用 .launch() 起服务。"""
     model_kind = _detect_model_kind(ckpt, tts)
 
+    # 查询模型支持的语种和（仅 CustomVoice 模型才有的）预置说话人列表。
     supported_langs_raw = None
     if callable(getattr(tts.model, "get_supported_languages", None)):
         supported_langs_raw = tts.model.get_supported_languages()
@@ -262,19 +308,24 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
     if callable(getattr(tts.model, "get_supported_speakers", None)):
         supported_spks_raw = tts.model.get_supported_speakers()
 
+    # 转成"展示名->内部名"的下拉框数据，UI 只展示美化后的名字。
     lang_choices_disp, lang_map = _build_choices_and_map([x for x in (supported_langs_raw or [])])
     spk_choices_disp, spk_map = _build_choices_and_map([x for x in (supported_spks_raw or [])])
 
     def _gen_common_kwargs() -> Dict[str, Any]:
+        """每次回调都复制一份默认生成参数，避免跨调用共享同一份 dict。"""
         return dict(gen_kwargs_default)
 
+    # Gradio 主题：使用 Soft 主题 + Source Sans Pro 字体。
     theme = gr.themes.Soft(
         font=[gr.themes.GoogleFont("Source Sans Pro"), "Arial", "sans-serif"],
     )
 
+    # 让 Gradio 容器占满宽度，便于显示长表单。
     css = ".gradio-container {max-width: none !important;}"
 
     with gr.Blocks(theme=theme, css=css) as demo:
+        # 页面顶部展示当前加载的模型路径和类型。
         gr.Markdown(
             f"""
 # Qwen3 TTS Demo
@@ -284,6 +335,8 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
         )
 
         if model_kind == "custom_voice":
+            # -------- 分支 1：CustomVoice（预置音色）UI --------
+            # 布局：左侧输入（文本+语种+说话人+指令），右侧输出音频+状态。
             with gr.Row():
                 with gr.Column(scale=2):
                     text_in = gr.Textbox(
@@ -315,14 +368,19 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                     err = gr.Textbox(label="Status (状态)", lines=2)
 
             def run_instruct(text: str, lang_disp: str, spk_disp: str, instruct: str):
+                """点击 Generate 按钮时由 Gradio 调用的回调。
+                负责把 UI 上的展示名翻译成模型用的内部名，再调 generate_custom_voice 合成。
+                返回 (音频, 状态文本)；任何异常都被捕获并显示在状态框里，避免页面崩溃。"""
                 try:
                     if not text or not text.strip():
                         return None, "Text is required (必须填写文本)."
                     if not spk_disp:
                         return None, "Speaker is required (必须选择说话人)."
+                    # 把下拉框展示名换回模型内部名；找不到则兜底用 "Auto"/展示名本身。
                     language = lang_map.get(lang_disp, "Auto")
                     speaker = spk_map.get(spk_disp, spk_disp)
                     kwargs = _gen_common_kwargs()
+                    # instruct 为空时传 None，模型走默认无指令模式。
                     wavs, sr = tts.generate_custom_voice(
                         text=text.strip(),
                         language=language,
@@ -334,9 +392,12 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                 except Exception as e:
                     return None, f"{type(e).__name__}: {e}"
 
+            # 把按钮点击事件绑定到 run_instruct：入参 4 个输入组件，出参 2 个输出组件。
             btn.click(run_instruct, inputs=[text_in, lang_in, spk_in, instruct_in], outputs=[audio_out, err])
 
         elif model_kind == "voice_design":
+            # -------- 分支 2：VoiceDesign（自然语言描述生成音色）UI --------
+            # 布局类似 custom_voice，但没有 speaker 下拉，而是让用户填一段音色描述。
             with gr.Row():
                 with gr.Column(scale=2):
                     text_in = gr.Textbox(
@@ -362,6 +423,8 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                     err = gr.Textbox(label="Status (状态)", lines=2)
 
             def run_voice_design(text: str, lang_disp: str, design: str):
+                """Generate 按钮回调：调 generate_voice_design 用自然语言描述合成音色。
+                入参 (文本, 展示语种, 音色描述)，返回 (音频, 状态)。"""
                 try:
                     if not text or not text.strip():
                         return None, "Text is required (必须填写文本)."
@@ -382,8 +445,11 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
             btn.click(run_voice_design, inputs=[text_in, lang_in, design_in], outputs=[audio_out, err])
 
         else:  # voice_clone for base
+            # -------- 分支 3：Base 模型（声音克隆）UI --------
+            # 用 Tabs 把"克隆并合成"与"保存/加载克隆音色"两个子功能分开。
             with gr.Tabs():
                 with gr.Tab("Clone & Generate (克隆并合成)"):
+                    # 布局：左 参考音频+参考文本+xvec_only 开关；中 待合成文本+语种+按钮；右 输出。
                     with gr.Row():
                         with gr.Column(scale=2):
                             ref_audio = gr.Audio(
@@ -418,9 +484,14 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                             err = gr.Textbox(label="Status (状态)", lines=2)
 
                     def run_voice_clone(ref_aud, ref_txt: str, use_xvec: bool, text: str, lang_disp: str):
+                        """Generate 按钮回调：调 generate_voice_clone 用参考音频做声音克隆。
+                        - use_xvec=False（ICL 模式）必须传 ref_text；
+                        - use_xvec=True 只用说话人向量，ref_text 可空但效果变差。
+                        返回 (音频, 状态)。"""
                         try:
                             if not text or not text.strip():
                                 return None, "Target text is required (必须填写待合成文本)."
+                            # Gradio 的音频组件返回值先规范化成 (wav, sr)。
                             at = _audio_to_tuple(ref_aud)
                             if at is None:
                                 return None, "Reference audio is required (必须上传参考音频)."
@@ -450,6 +521,9 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                     )
 
                 with gr.Tab("Save / Load Voice (保存/加载克隆音色)"):
+                    # 这个 Tab 把"先建 prompt 再合成"的两步流程可视化：
+                    # 左：上传参考音频/文本，点 Save -> 生成一个 .pt 音色文件；
+                    # 中：上传该 .pt 文件 + 新文本 -> 复用音色合成。
                     with gr.Row():
                         with gr.Column(scale=2):
                             gr.Markdown(
@@ -499,6 +573,9 @@ Upload a previously saved voice file, then synthesize new text.
                             err2 = gr.Textbox(label="Status (状态)", lines=2)
 
                     def save_prompt(ref_aud, ref_txt: str, use_xvec: bool):
+                        """Save Voice File 按钮回调：调 create_voice_clone_prompt 生成可复用 prompt，
+                        用 asdict 转成纯 dict 后用 torch.save 存到临时 .pt 文件返回给用户下载。
+                        这样用户可以把同一音色保存下来，未来多次合成都不必再传参考音频。"""
                         try:
                             at = _audio_to_tuple(ref_aud)
                             if at is None:
@@ -513,9 +590,11 @@ Upload a previously saved voice file, then synthesize new text.
                                 ref_text=(ref_txt.strip() if ref_txt else None),
                                 x_vector_only_mode=bool(use_xvec),
                             )
+                            # VoiceClonePromptItem 是 dataclass，asdict 展平成 dict 便于序列化。
                             payload = {
                                 "items": [asdict(it) for it in items],
                             }
+                            # tempfile.mkstemp 造一个临时文件路径，写完返回路径供 gr.File 下载。
                             fd, out_path = tempfile.mkstemp(prefix="voice_clone_prompt_", suffix=".pt")
                             os.close(fd)
                             torch.save(payload, out_path)
@@ -524,13 +603,18 @@ Upload a previously saved voice file, then synthesize new text.
                             return None, f"{type(e).__name__}: {e}"
 
                     def load_prompt_and_gen(file_obj, text: str, lang_disp: str):
+                        """Generate（加载侧）按钮回调：读取用户上传的 .pt 音色文件，
+                        还原成 VoiceClonePromptItem 列表，再调 generate_voice_clone
+                        用 voice_clone_prompt= 复用音色合成新文本。"""
                         try:
                             if file_obj is None:
                                 return None, "Voice file is required (必须上传音色文件)."
                             if not text or not text.strip():
                                 return None, "Target text is required (必须填写待合成文本)."
 
+                            # Gradio 的 File 组件可能是 NamedString/_file 之类，统一取路径。
                             path = getattr(file_obj, "name", None) or getattr(file_obj, "path", None) or str(file_obj)
+                            # weights_only=True 更安全：只允许加载张量/基本类型，避免任意代码执行。
                             payload = torch.load(path, map_location="cpu", weights_only=True)
                             if not isinstance(payload, dict) or "items" not in payload:
                                 return None, "Invalid file format (文件格式不正确)."
@@ -539,6 +623,7 @@ Upload a previously saved voice file, then synthesize new text.
                             if not isinstance(items_raw, list) or len(items_raw) == 0:
                                 return None, "Empty voice items (音色为空)."
 
+                            # 逐条把 dict 还原为 VoiceClonePromptItem；必要时把 numpy/list 转回 tensor。
                             items: List[VoiceClonePromptItem] = []
                             for d in items_raw:
                                 if not isinstance(d, dict):
@@ -564,6 +649,7 @@ Upload a previously saved voice file, then synthesize new text.
 
                             language = lang_map.get(lang_disp, "Auto")
                             kwargs = _gen_common_kwargs()
+                            # 用复用 prompt 合成：不需要再传 ref_audio/ref_text，直接传 voice_clone_prompt。
                             wavs, sr = tts.generate_voice_clone(
                                 text=text.strip(),
                                 language=language,
@@ -578,9 +664,11 @@ Upload a previously saved voice file, then synthesize new text.
                                 f"{type(e).__name__}: {e}"
                             )
 
+                    # 绑定两个按钮到对应回调。
                     save_btn.click(save_prompt, inputs=[ref_audio_s, ref_text_s, xvec_only_s], outputs=[prompt_file_out, err2])
                     gen_btn2.click(load_prompt_and_gen, inputs=[prompt_file_in, text_in2, lang_in2], outputs=[audio_out2, err2])
 
+        # 页面底部：免责声明（中英双语），说明合成音频仅供体验、禁止滥用。
         gr.Markdown(
             """
 **Disclaimer (免责声明)**  
@@ -593,18 +681,23 @@ Upload a previously saved voice file, then synthesize new text.
 
 
 def main(argv=None) -> int:
+    """CLI 入口：解析参数 -> 加载模型 -> 构建 demo -> 启动 Gradio 服务。
+    被 console_scripts `qwen-tts-demo` 调用，也支持 `python -m qwen_tts.cli.demo`。"""
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # 没给模型路径时只打印帮助信息并退出。
     if not args.checkpoint and not args.checkpoint_pos:
         parser.print_help()
         return 0
 
     ckpt = _resolve_checkpoint(args)
 
+    # 把字符串 dtype/flash-attn 标志转成 from_pretrained 需要的实际值。
     dtype = _dtype_from_str(args.dtype)
     attn_impl = "flash_attention_2" if args.flash_attn else None
 
+    # 加载 Qwen3-TTS 模型，device_map/dtype/attn 透传自命令行。
     tts = Qwen3TTSModel.from_pretrained(
         ckpt,
         device_map=args.device,
@@ -612,9 +705,11 @@ def main(argv=None) -> int:
         attn_implementation=attn_impl,
     )
 
+    # 收集命令行里的可选采样参数，传给 build_demo 作为各回调的默认 kwargs。
     gen_kwargs_default = _collect_gen_kwargs(args)
     demo = build_demo(tts, ckpt, gen_kwargs_default)
 
+    # 组装 Gradio launch 参数：绑定 IP/端口、是否开 share 公网链接、HTTPS 证书等。
     launch_kwargs: Dict[str, Any] = dict(
         server_name=args.ip,
         server_port=args.port,
